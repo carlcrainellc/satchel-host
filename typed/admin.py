@@ -36,7 +36,7 @@ def main(argv=None):
         raise SystemExit(f"no collection {a.coll!r} under {a.data}")
     h = Host(d, a.coll, load_host_key(a.data), {})
     if os.path.isdir(os.path.join(d, "blobs")):
-        h.blobs = BlobStore(os.path.join(d, "blobs"))
+        h.blobs = BlobStore(os.path.join(d, "blobs"), coll=a.coll, manage_uploads=False)
     if a.action == "header":
         print(json.dumps(h.set_header(a.description, a.rules)))
         return

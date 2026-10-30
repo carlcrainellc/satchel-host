@@ -1,6 +1,6 @@
 # Running your own host
 
-*satchel-host 0.5.0*
+*satchel-host 0.5.1*
 
 satchel-host runs a piece of a Satchel community on your own server: chat rooms, a wiki, a
 file drop, a profile directory, a directory of communities, an app collection, a mail host or
@@ -43,7 +43,7 @@ Types:
 |---|---|
 | `rooms` | one or more chat rooms (`--room NAME` adds another, repeatable) |
 | `wiki` | a wiki |
-| `files` | an encrypted file drop (files up to 4 MiB, ciphertext only) |
+| `files` | an encrypted file drop (files up to 25 MiB by default, ciphertext only) |
 | `people` | a profile directory |
 | `directory` | a directory of communities; each entry is signed by the listed collection's root key |
 | `apps` | an app collection: small JavaScript apps that Satchel runs in a sandbox |
@@ -163,7 +163,8 @@ then sign and install the new `request.json` like the first time.
 
 `init --type rooms … --voice` lets people post short voice clips (up to 30 seconds) in the
 host's rooms. Clip files are deleted 7 days after upload. In each room, each key can store up
-to 4 MiB of clips and post 60 clips in any 24 hours.
+to 4 MiB of clips and post 60 clips in any 24 hours (clips still uploading count too), and all
+clips in a room together are capped at 256 MiB.
 
 ## Running a mail host
 
@@ -226,10 +227,11 @@ or anything a valid legal order covers.
 
     satchel-host moderate --prefix … remove post <id> --reason "illegal content"
 
-It asks you to type `REMOVE` (or pass `--yes`). Your host then deletes the post text from its
-disk at once. For a file, it deletes the file's bytes too. The post leaves a small signed
-placeholder, so the room's history still verifies. Mirrors and Satchel delete their
-copies the next time they sync, and the post shows as "Removed by host: <reason>". Nobody can
+It asks you to type `REMOVE` (or pass `--yes`). Your host removes the post text from its
+database right away and clears it from the database's write-ahead log, and a daily clean-up
+compacts the database file. For a file, it deletes the file's bytes too (unless another live
+post shares the same file). The post leaves a small signed placeholder, so the room's history
+still verifies. Mirrors and Satchel drop their copies the next time they sync, and the post shows as "Removed by host: <reason>". Nobody can
 show it again. A remove can't be undone, and the record, including your reason, is public, so
 don't put personal data in the reason. Removing content doesn't take back copies someone
 already downloaded or screenshotted. Report illegal material to the authorities where the
@@ -237,16 +239,32 @@ law requires it.
 
 ## File limits (files hosts)
 
-`satchel-host init --type files … --max-file-mb 25 --quota-mb 500` sets the largest file and
-the MiB each uploader key may store (0 means no quota). Change them later with
-`satchel-host files --prefix … --max-file-mb 50`. The limits are in your signed policy, so
-Satchel refuses a file that's too large before uploading it. Large files upload in 1 MiB chunks
-and resume after an interruption. Make sure your disk can hold the total you allow.
+`satchel-host init --type files … --max-file-mb 25 --quota-mb 250 --total-mb 2048` sets the
+largest file, the MiB each uploader key may store (0 means no per-key quota) and the MiB the
+whole host may store. Those are the defaults. Change them later with
+`satchel-host files --prefix … --max-file-mb 50 --total-mb 4096`. The limits are in your signed
+policy, so Satchel refuses a file that's too large before uploading it.
+
+Every upload is signed by the uploader's key. When it starts, the host sets aside room for the
+whole file in that key's quota and in the total, so a half-finished upload counts too. Large
+files upload in 1 MiB chunks and can resume after an interruption, but an upload that sits
+idle for an hour is dropped and its space freed. When the total is full, new uploads are
+refused until something is removed. Make sure your disk can hold the total you set.
 
 ## What your host does and doesn't do
 
 - It checks every record's signature and its small proof-of-work puzzle, and it applies rate
   limits. New keys get a slightly harder puzzle.
+- Besides the limit per key, each collection has a write budget for all keys together, so a
+  crowd of fresh keys can't flood it. When it runs out, posts get "this host is busy; try
+  later" until it refills. `init --pow-bits N` (8 to 28) makes the puzzle harder for everyone
+  (new keys get N+2), and `init --rate 600/3600` sets the shared budget (writes per seconds,
+  repeatable). Both apply to every collection on the host. `--rate` isn't available for
+  `board` hosts, and neither flag for `mail`.
+- People can delete their own posts, at most 30 an hour. The host removes the text the same
+  way as a moderator remove.
+- Room and board posts older than 180 days are removed the same way.
+  Wiki pages and apps are kept.
 - You can hide, remove and pin posts (see "Moderating" above). Every action is signed and public.
 - Apps are added only by you, with your root key. Satchel asks people before it runs one,
   and again whenever its code changes.
@@ -256,7 +274,9 @@ and resume after an interruption. Make sure your disk can hold the total you all
 
 ## Security defaults the installer sets
 
-Runs as an unprivileged `satchelhost` user. The data directory is mode 700 and the host key
+Runs as an unprivileged `satchelhost` user (created with its own group if it doesn't exist;
+`--user` picks another existing account). `satchel-host run` started as root switches to that
+user before the host starts. The data directory is mode 700 and the host key
 is mode 600. Under systemd the service has no capabilities, a read-only system, no home
 access, private /tmp and devices, and its network is limited to localhost by systemd's IP
 filter. The host refuses to bind a public address.

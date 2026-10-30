@@ -21,7 +21,7 @@ import secrets
 import threading
 import time
 from collections import deque
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 from . import mail as M
 from .host import load_host_key
@@ -260,11 +260,16 @@ def make_handler(h: Host):
             self._json(404, {"error": "not found"})
 
         def do_POST(self):
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > MAX_REQ:
-                return self._json(413, {"ok": False, "error": "too_large"})
+            # every request is a JSON object: no length (or chunked), zero or too much is
+            # refused before reading, as typed/node.py does
             try:
-                r = json.loads(self.rfile.read(n) or b"{}")
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n <= 0 or n > MAX_REQ:
+                return self._json(413, {"ok": False, "error": "too_large" if n > 0 else "size"})
+            try:
+                r = json.loads(self.rfile.read(n))
                 if not isinstance(r, dict):
                     raise ValueError
             except ValueError:
@@ -278,7 +283,12 @@ def make_handler(h: Host):
 
 
 def serve(h: Host, bind="127.0.0.1", port=0, purge=True):
-    srv = ThreadingHTTPServer((bind, port), make_handler(h))
+    """Same bind rule as the collection hosts: loopback, private or ULA addresses only."""
+    from .node import bind_ok, _Srv4, _Srv6
+    if not bind_ok(bind):
+        raise SystemExit(f"refusing bind to {bind}: use loopback, private or fd00::/8 ULA")
+    a = bind.strip("[]")
+    srv = (_Srv6 if ":" in a else _Srv4)((a, port), make_handler(h))
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     if purge:

@@ -114,18 +114,33 @@ class Store:
                             (pid,)).fetchone()
         return r[0] if r else None
 
-    def redact(self, pid: str, tomb: dict) -> bool:
+    def redact(self, pid: str, tomb: dict, scrub: bool = True) -> bool:
+        """Drop the text of one entry, keeping its id and link so the chain still verifies.
+        secure_delete zeroes the old bytes in the database file; scrub() then empties the WAL,
+        which still holds the old page.  Batches pass scrub=False and call scrub() once."""
         with self.lock:
             r = self.db.execute("SELECT env FROM log WHERE id=? AND tomb IS NULL", (pid,)).fetchone()
             if r is None:
                 return False
             c = self.db.execute("UPDATE log SET env='null', tomb=? WHERE id=? AND tomb IS NULL",
                                 (json.dumps(tomb), pid))
-            if tomb.get("by") == "remove":  # host removal: wipe old copies out of the WAL now
-                self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if scrub:
+                self.scrub()
             if c.rowcount and self.on_redact:
                 self.on_redact(pid, json.loads(r[0]), tomb)
             return c.rowcount > 0
+
+    def scrub(self) -> None:
+        """Write the WAL back into the database and truncate it, so removed text isn't left in
+        old WAL frames."""
+        with self.lock:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def vacuum(self) -> None:
+        """Rebuild the database file (drops free pages), then scrub the WAL."""
+        with self.lock:
+            self.db.execute("VACUUM")
+            self.scrub()
 
     def _rows(self, q, args):
         out = []
@@ -162,6 +177,20 @@ class Store:
     def rhead(self) -> int:
         r = self.db.execute("SELECT MAX(rseq) FROM records").fetchone()
         return r[0] or 0
+
+    def live_of_type(self, t: str) -> list:
+        """(author, envelope) of live entries of record type t, oldest first."""
+        return [(r[0], json.loads(r[1])) for r in self.db.execute(
+            "SELECT author, env FROM log WHERE t=? AND tomb IS NULL ORDER BY seq", (t,))]
+
+    def has_record(self, rid: str) -> bool:
+        return self.db.execute("SELECT 1 FROM records WHERE rid=?", (rid,)).fetchone() is not None
+
+    def live_mentioning(self, text: str) -> list:
+        """Envelopes of live entries whose stored JSON contains text (callers re-check)."""
+        pat = "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        return [json.loads(r[0]) for r in self.db.execute(
+            "SELECT env FROM log WHERE tomb IS NULL AND env LIKE ? ESCAPE '\\'", (pat,))]
 
     def add_record(self, kind: str, rec: dict, rid: str, rseq: int | None = None) -> int | None:
         """Append (host) or import with the primary's rseq (mirror/client).  Idempotent by rid."""

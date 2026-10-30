@@ -1,6 +1,7 @@
 // End-to-end check against a Satchel checkout: a local satchel-host serves a room and an app
 // collection, the starter app is published and pointed at, and Satchel's own core and
-// sandbox load it the way the browser would.
+// sandbox load it the way the browser would. A second host serves a file drop: Satchel
+// uploads (signed, chunked), opens and deletes files there, and deletes its own room post.
 //
 //   cd satchel && npm install          (once)
 //   SATCHEL=/path/to/satchel node tests/e2e_satchel.mjs
@@ -9,7 +10,7 @@
 import assert from "node:assert/strict";
 import {execFileSync, spawn} from "node:child_process";
 import {createHash} from "node:crypto";
-import {mkdtempSync, readFileSync} from "node:fs";
+import {existsSync, mkdtempSync, readFileSync, readdirSync} from "node:fs";
 import {createRequire} from "node:module";
 import {createServer} from "node:net";
 import {tmpdir} from "node:os";
@@ -45,10 +46,21 @@ const pin = readFileSync(join(t, "root", "root.pin"), "utf8").trim();
 cli("init", "--type", "rooms", "--name", "lobby", "--prefix", pre, "--port", String(port), "--apps", "apps", "--sesh", "skip");
 cli("root", "sign", join(pre, "request.json"), "--root-key", join(t, "root", "root.key"), "--days", "30", "--yes", "--out", join(t, "d.json"));
 cli("install-delegation", join(t, "d.json"), "--prefix", pre, "--no-systemd");
+const fport = await freePort();
+const fpre = join(t, "files");
+cli("init", "--type", "files", "--name", "files", "--prefix", fpre, "--port", String(fport), "--sesh", "skip");
+cli("root", "sign", join(fpre, "request.json"), "--root-key", join(t, "root", "root.key"), "--days", "30", "--yes", "--out", join(t, "f.json"));
+cli("install-delegation", join(t, "f.json"), "--prefix", fpre, "--no-systemd");
+const started = (p) => new Promise((res, rej) => { p.stdout.once("data", res); p.once("exit", (c) => rej(new Error("host exited " + c))); });
 const host = spawn("python3", [CLI, "run", "--prefix", pre], {stdio: ["ignore", "pipe", "inherit"]});
+const fhost = spawn("python3", [CLI, "run", "--prefix", fpre], {stdio: ["ignore", "pipe", "inherit"]});
+// every byte the host's database holds: the file plus its write-ahead log
+const dbText = (p, coll) => readdirSync(join(p, "data", coll)).filter((f) => f.startsWith("log.sqlite3"))
+  .map((f) => readFileSync(join(p, "data", coll, f)).toString("latin1")).join("");
 let ok = false;
 try {
-  await new Promise((res, rej) => { host.stdout.once("data", res); host.once("exit", (c) => rej(new Error("host exited " + c))); });
+  await started(host);
+  await started(fhost);
 
   const srcPath = join(PACK, "apps", "starter", "hello.js");
   const src = readFileSync(srcPath, "utf8");
@@ -59,10 +71,13 @@ try {
 
   // Satchel reaches hosts by .sesh name; map a made-up one to the local port.
   const name = "y".repeat(52) + ".sesh";
-  const fetchFn = (url, opt = {}) => { const u = new URL(url); return fetch(u.host === name ? `http://127.0.0.1:${port}${u.pathname}${u.search}` : url, opt); };
+  const fname = "z".repeat(52) + ".sesh";
+  const ports = {[name]: port, [fname]: fport};
+  const fetchFn = (url, opt = {}) => { const u = new URL(url); return fetch(ports[u.host] ? `http://127.0.0.1:${ports[u.host]}${u.pathname}${u.search}` : url, opt); };
   const config = {collections: [
     {name: "lobby", kind: "room", root_pin: pin, hosts: [`http://${name}/c/lobby`]},
     {name: "apps", kind: "app", root_pin: pin, hosts: [`http://${name}/c/apps`]},
+    {name: "files", kind: "drop", root_pin: pin, hosts: [`http://${fname}/c/files`]},
   ]};
   const vault = new Vault(new MemKv(), {iter: 100000}); await vault.load(); await vault.create("correct horse battery");
   const c = await Core.open({kv: new MemKv(), net: new Net({relay: false, fetchFn}), vault, config});
@@ -110,9 +125,47 @@ try {
   const last = msgs.filter((m) => m.type === "render").at(-1).tree;
   checkTree(last);
   assert.ok(JSON.stringify(last).includes("hello from the e2e test"));
+
+  // Deleting your own room post: the host drops the text from its database at once.
+  const marker = "e2e-delete-me-" + sha(Buffer.from(String(Date.now()))).slice(0, 12);
+  const pd = await c.draft("lobby", "room.msg", {text: marker}, []);
+  const posted = await c.confirm(pd.token);
+  assert.equal(posted.ok, true, JSON.stringify(posted));
+  await c.sync();
+  assert.ok(dbText(pre, "lobby").includes(marker));
+  const del = await c.delete("lobby", posted.id);
+  assert.equal(del.ok, true, JSON.stringify(del));
+  assert.ok(!dbText(pre, "lobby").includes(marker), "deleted text is gone from the host's database files");
+  // the log keeps the post's id as a placeholder, so the history still verifies
+  const again = await (await fetch(`http://127.0.0.1:${port}/c/lobby/v1/log?after=0`)).json();
+  assert.ok(JSON.stringify(again).includes(posted.id));
+
+  // Files: Satchel's signed chunked upload (no unsigned /v1/blob), open, then delete.
+  const blobs = join(fpre, "data", "files", "blobs");
+  const fileData = new Uint8Array(1500000).map((_, i) => (i * 31) & 255);   // two chunks
+  const up = await c.drops.prepareUpload("files", fileData, "e2e.bin", "application/octet-stream", {mode: "gated"});
+  assert.ok(up.token, JSON.stringify(up));
+  const stored = await c.confirm(up.token);
+  assert.equal(stored.ok, true, JSON.stringify(stored));
+  await c.sync();
+  c.drops.cache = new (c.drops.cache.constructor)();   // fetch it back from the host
+  const opened = await c.drops.openFile("files", stored.id);
+  assert.equal(opened.name, "e2e.bin");
+  assert.equal(Buffer.compare(Buffer.from(opened.data), Buffer.from(fileData)), 0);
+  const onDisk = readdirSync(blobs).filter((f) => /^[0-9a-f]{64}$/.test(f));
+  assert.equal(onDisk.length, 1);
+  const unsigned = await fetch(`http://127.0.0.1:${fport}/c/files/v1/blob`, {method: "POST", body: new Uint8Array(10)});
+  assert.equal(unsigned.status, 403);
+  const fdel = await c.delete("files", stored.id);
+  assert.equal(fdel.ok, true, JSON.stringify(fdel));
+  assert.ok(!existsSync(join(blobs, onDisk[0])), "the file's bytes are deleted with the post");
+  assert.equal((await fetch(`http://127.0.0.1:${fport}/c/files/v1/blob/${onDisk[0]}`)).status, 404);
+
   ok = true;
-  console.log("e2e ok: host served the room and the app collection; Satchel listed, fetched, checked and ran the starter app");
+  console.log("e2e ok: host served the room and the app collection; Satchel listed, fetched, checked and ran the starter app; " +
+              "deleted its own post; uploaded, opened and deleted a file");
 } finally {
   host.kill();
+  fhost.kill();
   if (!ok) process.exitCode = 1;
 }

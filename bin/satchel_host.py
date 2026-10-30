@@ -13,6 +13,7 @@ Session Router / .sesh exposure is prepared but switched on only by you.
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import os
 import pwd
@@ -28,7 +29,7 @@ PACK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PACK_ROOT)
 import mbfmt as F  # noqa: E402
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 # host type -> (process, collection kind).  "board" runs the message-board host; the rest
 # run the typed hub (hub types can also carry app collections, see --apps).
 TYPES = {"board": ("board", None), "wiki": ("hub", "wiki"),
@@ -36,9 +37,11 @@ TYPES = {"board": ("board", None), "wiki": ("hub", "wiki"),
          "directory": ("hub", "directory"), "apps": ("hub", "app"), "mail": ("mail", None)}
 DEFAULT_PORT = {"board": 48900, "wiki": 48911, "rooms": 48912, "files": 48913,
                 "people": 48914, "mail": 48915, "directory": 48916, "apps": 48917}
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")  # always fullmatch
 APP_DIRS = tuple(d for d in ("mbfmt", "mbhost", "typed", "vendor") if os.path.isdir(os.path.join(PACK_ROOT, d)))
 SERVICE_USER = "satchelhost"
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")  # always fullmatch
+PREFIX_RE = re.compile(r"/[A-Za-z0-9._/-]{0,200}")  # absolute, one token, no quotes or spaces
 MAX_DAYS = F.MAX_DELEGATION_S // 86400
 REQ_KIND = "srnet-host-delegation-request/v1"
 
@@ -76,10 +79,35 @@ def host_key(cfg):
         return F.key_from_seed(f.read())
 
 
+def safe_coll(name):
+    """A collection name, checked before it becomes part of any path."""
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        die(f"bad collection name {name!r}")
+    return name
+
+
 def colls(cfg):
     """Collections this host serves: its name, any extra rooms (rooms hosts), then any app
-    collections (hub hosts)."""
-    return (cfg.get("collections") or [cfg["name"]]) + list(cfg.get("app_colls") or [])
+    collections (hub hosts).  Every name is checked, since each one becomes a path."""
+    return [safe_coll(c) for c in
+            (cfg.get("collections") or [cfg["name"]]) + list(cfg.get("app_colls") or [])]
+
+
+def check_user(user):
+    if not isinstance(user, str) or not USER_RE.fullmatch(user):
+        die(f"--user {user!r}: a plain user name (lowercase letters, digits, _ and -, max 32)")
+    if user == "root":
+        die("--user root: the host must not run as root; leave --user out to use "
+            f"{SERVICE_USER}")
+    return user
+
+
+def check_prefix(prefix):
+    """An absolute path made of safe characters only (it goes into the systemd unit)."""
+    p = os.path.abspath(prefix)
+    if not PREFIX_RE.fullmatch(p) or any(part in ("..", ".") for part in p.split("/")) or p == "/":
+        die(f"--prefix {prefix!r}: an absolute path of letters, digits, '.', '_', '-' and '/'")
+    return p
 
 
 def coll_kind(cfg, coll):
@@ -132,7 +160,7 @@ def sign_request(root_key, req: dict, days: int, now=None) -> dict:
     out = {"kind": "srnet-host-delegation/v1", "root": F.pub_hex(root_key), "host": req["host"],
            "delegations": {}}
     for coll in req["collections"]:
-        if not NAME_RE.match(coll):
+        if not NAME_RE.fullmatch(coll):
             die(f"bad collection name {coll!r}")
         d = {"v": 1, "board": coll, "root": F.pub_hex(root_key), "host": req["host"],
              "issued": now, "expires": now + days * 86400, "policy": ""}
@@ -161,11 +189,12 @@ def exec_cmd(cfg):
     pre = cfg["prefix"]
     py = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
     if cfg["type"] == "board":
-        return [py, "-m", "mbhost.host", "--data", f"{pre}/data", "--board", cfg["name"],
+        # same soft PoW as the older board hosts (16 / 18 for new keys) unless --pow-bits
+        pb = int(cfg.get("pow_bits") or 16)
+        return [py, "-m", "mbhost.host", "--data", f"{pre}/data", "--board", safe_coll(cfg["name"]),
                 "--bind", "127.0.0.1", "--port", str(cfg["port"]),
                 "--delegation", f"{pre}/delegation/{cfg['name']}.json", "--tick", "30",
-                # same soft PoW as the older board hosts (16 / 18 for new keys); unchanged defaults
-                "--pow-bits", "16", "--new-key-pow-bits", "18"]
+                "--pow-bits", str(pb), "--new-key-pow-bits", str(pb + 2)]
     if cfg["type"] == "mail":  # sealed store-and-forward; never sees content or senders
         return [py, "-m", "typed.mailhost", "--data", f"{pre}/data", "--bind", "127.0.0.1",
                 "--port", str(cfg["port"]), "--delegation", f"{pre}/delegation/{cfg['name']}.json",
@@ -179,14 +208,31 @@ def exec_cmd(cfg):
         cmd += ["--voice"]
     if kind == "drop":
         cmd += ["--max-file-mb", str(cfg.get("max_file_mb", 25)),
-                "--quota-mb", str(cfg.get("quota_mb", 0))]
+                "--quota-mb", str(cfg.get("quota_mb", 0)),
+                "--total-mb", str(cfg.get("total_mb", DEFAULT_TOTAL_MB))]
+    if cfg.get("pow_bits") is not None:
+        cmd += ["--pow-bits", str(int(cfg["pow_bits"]))]
+    for n, w in cfg.get("rate") or []:
+        cmd += ["--rate", f"{int(n)}/{int(w)}"]
     for a in cfg.get("admins", []):
         cmd += ["--admin", a]
     return cmd
 
 
+def sd_quote(arg: str) -> str:
+    """One ExecStart argument, quoted the way systemd reads it: plain safe tokens as they are,
+    anything else in double quotes with \\, \" escaped, and % and $ doubled (no expansion)."""
+    arg = str(arg)
+    if re.fullmatch(r"[A-Za-z0-9_@+=:,./-]+", arg):
+        return arg
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in arg):
+        die(f"argument with a control character: {arg!r}")
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+
+
 def unit_text(cfg):
-    pre = cfg["prefix"]
+    pre = check_prefix(cfg["prefix"])
+    check_user(cfg["user"])
     return f"""# generated by satchel-host {VERSION}; do not edit by hand (re-run satchel-host)
 [Unit]
 Description=Satchel {cfg['type']} host '{cfg['name']}' (loopback only)
@@ -196,7 +242,7 @@ After=network.target
 User={cfg['user']}
 WorkingDirectory={pre}/app
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart={' '.join(exec_cmd(cfg))}
+ExecStart={' '.join(sd_quote(x) for x in exec_cmd(cfg))}
 Restart=on-failure
 RestartSec=5
 UMask=0077
@@ -234,24 +280,36 @@ WantedBy=multi-user.target
 def cmd_init(a):
     if a.type not in TYPES:
         die(f"--type must be one of {', '.join(TYPES)}")
-    if not NAME_RE.match(a.name) or not a.name[0].isalpha():
+    if not NAME_RE.fullmatch(a.name) or not a.name[0].isalpha():
         die("--name: starts with a letter; lowercase letters, digits, dashes; max 32")
     extra = [r for r in (a.room or []) if r != a.name]
     if extra and a.type != "rooms":
         die("--room is for rooms hosts")
     for r in extra:
-        if not NAME_RE.match(r) or not r[0].isalpha():
+        if not NAME_RE.fullmatch(r) or not r[0].isalpha():
             die(f"--room {r!r}: starts with a letter; lowercase letters, digits, dashes; max 32")
     app_colls = sorted(set(a.apps or []))
     if app_colls and TYPES[a.type][0] != "hub":
         die("--apps is for hub hosts (rooms, wiki, files, people, directory, apps)")
     for r in app_colls:
-        if not NAME_RE.match(r) or not r[0].isalpha() or r == a.name or r in extra:
+        if not NAME_RE.fullmatch(r) or not r[0].isalpha() or r == a.name or r in extra:
             die(f"--apps {r!r}: a new collection name (starts with a letter; lowercase "
                 "letters, digits, dashes; max 32)")
     if a.voice and a.type != "rooms":
         die("--voice is for rooms hosts")
-    prefix = os.path.abspath(a.prefix or f"/opt/satchel-host/{a.name}")
+    prefix = check_prefix(a.prefix or f"/opt/satchel-host/{a.name}")
+    user = check_user(a.user or (SERVICE_USER if is_root() else pwd.getpwuid(os.getuid()).pw_name))
+    if a.user and is_root() and a.user != SERVICE_USER:
+        try:
+            pwd.getpwnam(a.user)
+        except KeyError:
+            die(f"--user {a.user}: no such user (create it first, or leave --user out)")
+    if a.pow_bits is not None and not 8 <= a.pow_bits <= 28:
+        die("--pow-bits must be between 8 and 28")
+    if a.rate and TYPES[a.type][0] != "hub":
+        die("--rate is for hub hosts (rooms, wiki, files, people, directory, apps)")
+    if a.pow_bits is not None and a.type == "mail":
+        die("--pow-bits is not used by mail hosts")
     if os.path.exists(os.path.join(prefix, "host.json")):
         die(f"{prefix} already has a host (use status / renew / uninstall)")
     port = a.port or DEFAULT_PORT[a.type]
@@ -268,7 +326,6 @@ def cmd_init(a):
         shutil.rmtree(dst, ignore_errors=True)
         shutil.copytree(os.path.join(PACK_ROOT, d), dst,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    user = a.user or (SERVICE_USER if is_root() else pwd.getpwuid(os.getuid()).pw_name)
     cfg = {"v": 1, "type": a.type, "name": a.name, "prefix": prefix, "port": port,
            "user": user, "root_pin": "", "admins": a.admin,
            "installed": int(time.time()), "pack": VERSION, "systemd": False}
@@ -281,20 +338,19 @@ def cmd_init(a):
     if a.type == "mail":
         cfg["closed"], cfg["max_inboxes"] = bool(a.closed), a.max_inboxes
     if a.type == "files":
-        cfg["max_file_mb"], cfg["quota_mb"] = check_mb(a.max_file_mb, a.quota_mb)
+        cfg["max_file_mb"], cfg["quota_mb"], cfg["total_mb"] = check_mb(
+            a.max_file_mb, a.quota_mb, a.total_mb)
+    if a.pow_bits is not None:
+        cfg["pow_bits"] = a.pow_bits
+    if a.rate:
+        cfg["rate"] = a.rate
     os.chmod(os.path.join(prefix, "data"), 0o700)
     from typed.host import load_host_key
     load_host_key(os.path.join(prefix, "data"))
     save_cfg(cfg)
-    if is_root() and user == SERVICE_USER:
-        try:
-            pwd.getpwnam(user)
-        except KeyError:
-            sh("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", user)
-        shutil.chown(os.path.join(prefix, "data"), user, user)
-        for root_, dirs, files in os.walk(os.path.join(prefix, "data")):
-            for n in dirs + files:
-                shutil.chown(os.path.join(root_, n), user, user)
+    if is_root():
+        ensure_service_user(user)
+        chown_tree(os.path.join(prefix, "data"), user)
     mode, path = choose_sesh_mode(a)
     sname = sesh_setup(cfg, mode, path)
     save_cfg(cfg)
@@ -310,6 +366,33 @@ def cmd_init(a):
     print(f"  satchel-host root sign {os.path.basename(req)} --days 90")
     print("then bring delegation.json back and run:")
     print(f"  satchel-host install-delegation delegation.json --prefix {prefix}")
+
+
+def ensure_service_user(user):
+    """As root: make the service user (and a group of the same name) if it doesn't exist."""
+    try:
+        pwd.getpwnam(user)
+        return
+    except KeyError:
+        pass
+    if user != SERVICE_USER:
+        die(f"user {user} doesn't exist")
+    try:
+        grp.getgrnam(user)
+        group = ["--gid", user]  # the group is already there: join it
+    except KeyError:
+        group = ["--user-group"]  # create it with the user
+    sh("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", *group, user)
+
+
+def chown_tree(path, user):
+    """Give path and everything under it to user and the user's PRIMARY group (no group of
+    the user's name is assumed)."""
+    pw = pwd.getpwnam(user)
+    for root_, dirs, files in os.walk(path):
+        os.chown(root_, pw.pw_uid, pw.pw_gid)
+        for n in files:
+            os.chown(os.path.join(root_, n), pw.pw_uid, pw.pw_gid, follow_symlinks=False)
 
 
 def cmd_root_init(a):
@@ -354,8 +437,15 @@ def cmd_install_delegation(a):
     with open(a.bundle) as f:
         bundle = json.load(f)
     root = check_bundle(cfg, bundle, a.allow_root_change)
-    for coll, env in bundle["delegations"].items():
-        write_private(os.path.join(cfg["prefix"], "delegation", f"{coll}.json"), jdump(env), 0o644)
+    # only this host's own collections are written; any other key in the bundle is ignored
+    # (names come from host.json and are checked, never from the bundle)
+    for coll in colls(cfg):
+        write_private(os.path.join(cfg["prefix"], "delegation", f"{coll}.json"),
+                      jdump(bundle["delegations"][coll]), 0o644)
+    extra = sorted(str(k) for k in (bundle.get("delegations") or {}) if k not in colls(cfg))
+    if extra:
+        print(f"note: ignored delegations for collections this host doesn't serve: "
+              f"{', '.join(repr(k) for k in extra)}")
     cfg["root_pin"] = root
     write_private(os.path.join(cfg["prefix"], "unit.service"), unit_text(cfg).encode(), 0o644)
     if a.no_systemd or not (is_root() and have_systemd()):
@@ -425,27 +515,35 @@ def cmd_mail(a):
           + ("" if cfg.get("systemd") else " (restart `satchel-host run` to apply)"))
 
 
-def check_mb(max_file_mb, quota_mb):
+DEFAULT_QUOTA_MB = 250
+DEFAULT_TOTAL_MB = 2048
+
+
+def check_mb(max_file_mb, quota_mb, total_mb=DEFAULT_TOTAL_MB):
     if not (0 < max_file_mb <= 256):
         die("--max-file-mb must be more than 0 and at most 256")
     if quota_mb < 0:
-        die("--quota-mb must be >= 0 (0 = no quota)")
-    return max_file_mb, quota_mb
+        die("--quota-mb must be >= 0 (0 = no per-uploader quota)")
+    if not total_mb > 0:
+        die("--total-mb must be more than 0 (the total cap is always on)")
+    return max_file_mb, quota_mb, total_mb
 
 
 def cmd_files(a):
     cfg = load_cfg(a.prefix)
     if cfg["type"] != "files":
         die("not a files host")
-    cfg["max_file_mb"], cfg["quota_mb"] = check_mb(
+    cfg["max_file_mb"], cfg["quota_mb"], cfg["total_mb"] = check_mb(
         cfg.get("max_file_mb", 25) if a.max_file_mb is None else a.max_file_mb,
-        cfg.get("quota_mb", 0) if a.quota_mb is None else a.quota_mb)
+        cfg.get("quota_mb", 0) if a.quota_mb is None else a.quota_mb,
+        cfg.get("total_mb", DEFAULT_TOTAL_MB) if a.total_mb is None else a.total_mb)
     save_cfg(cfg)
     write_private(os.path.join(cfg["prefix"], "unit.service"), unit_text(cfg).encode(), 0o644)
     if cfg.get("systemd") and is_root() and have_systemd():
         install_unit(cfg)
     print(f"files host '{cfg['name']}': max file {cfg['max_file_mb']} MiB, quota "
-          f"{cfg['quota_mb'] or 'none'}{' MiB per uploader' if cfg['quota_mb'] else ''}"
+          f"{cfg['quota_mb'] or 'none'}{' MiB per uploader' if cfg['quota_mb'] else ''}, "
+          f"{cfg['total_mb']} MiB in all"
           + ("" if cfg.get("systemd") else " (restart `satchel-host run` to apply)"))
 
 
@@ -468,19 +566,18 @@ def _coll_host(cfg, coll):
         h.blobs = BundleStore(os.path.join(d, "blobs"), coll)
     elif os.path.isdir(os.path.join(d, "blobs")):
         from typed.hub import BlobStore
-        h.blobs = BlobStore(os.path.join(d, "blobs"), coll=coll)
+        # only used to delete a removed file; uploads in progress belong to the running host
+        h.blobs = BlobStore(os.path.join(d, "blobs"), coll=coll, manage_uploads=False)
     return h, d
 
 
 def _fix_owner(cfg, d):
     """Run as root: give files we created back to the service user."""
     if is_root() and cfg.get("user") and cfg["user"] != "root":
-        for root, dirs, files in os.walk(d):
-            for n in dirs + files:
-                try:
-                    shutil.chown(os.path.join(root, n), cfg["user"], cfg["user"])
-                except (LookupError, OSError):
-                    pass
+        try:
+            chown_tree(d, cfg["user"])
+        except (LookupError, OSError):
+            pass
 
 
 def cmd_moderate(a):
@@ -488,8 +585,9 @@ def cmd_moderate(a):
     if a.action in ("remove", "pin", "unpin") and a.target_type != "post":
         die(f"{a.action} takes a post id")
     if a.action == "remove" and not a.yes:
-        print(f"This deletes post {a.target} (and its file, if any) from this host now, and from "
-              "mirrors and clients when they sync. It can't be undone.")
+        print(f"This removes post {a.target} (and its file, if any) from this host's database "
+              "and storage now; mirrors and Satchel drop their copies when they next sync. "
+              "It can't be undone.")
         try:
             ok = input("Type REMOVE to continue: ").strip() == "REMOVE"
         except EOFError:
@@ -522,12 +620,34 @@ def cmd_header(a):
     print(json.dumps(out))
 
 
+def drop_privileges(cfg):
+    """Started as root: switch to the service user (its uid, primary gid and groups) before
+    the host runs.  Refuses to go on as root."""
+    if not is_root():
+        return
+    user = check_user(cfg.get("user") or "")
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        die(f"service user {user} doesn't exist (run init as root, or create it)")
+    if pw.pw_uid == 0:
+        die(f"service user {user} has uid 0; refusing to run the host as root")
+    os.initgroups(user, pw.pw_gid)
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
+    if os.geteuid() == 0 or os.getuid() == 0:
+        die("could not drop root privileges")
+    os.environ.update(HOME=pw.pw_dir or "/", USER=user, LOGNAME=user)
+
+
 def cmd_run(a):
     cfg = load_cfg(a.prefix)
     if not cfg.get("root_pin"):
         die("no delegation installed yet")
+    cmd = exec_cmd(cfg)
+    drop_privileges(cfg)
     os.chdir(os.path.join(cfg["prefix"], "app"))
-    os.execv(exec_cmd(cfg)[0], exec_cmd(cfg))
+    os.execv(cmd[0], cmd)
 
 
 def delegation_left(cfg):
@@ -777,7 +897,7 @@ def cmd_root_directory_entry(a):
         die(f"--link: {e}")
     if not ln["kind"] or ln["root"] != F.pub_hex(key):
         die("the link must name a collection and carry #root= of THIS root key")
-    if not NAME_RE.match(a.directory_name):
+    if not NAME_RE.fullmatch(a.directory_name):
         die("--directory-name: the directory collection's name")
     env = make_record(key, KIND_TYPES["directory"], a.directory_name, "directory.entry",
                       {"link": a.link, "title": a.title[:80], "desc": a.desc}, [],
@@ -814,7 +934,7 @@ def cmd_root_app_bundle(a):
         AP.check_source(src)
         if not AP.NAME_RE.fullmatch(name):
             raise F.FormatError("--name: starts with a letter; lowercase letters, digits, dashes; max 32")
-        if not NAME_RE.match(a.coll):
+        if not NAME_RE.fullmatch(a.coll):
             raise F.FormatError("--coll: the app collection's name")
         body = AP.bundle_body(name, a.title, a.ver, src, a.caps, a.desc)
         env = make_record(key, KIND_TYPES["app"], a.coll, "app.bundle", body, [],
@@ -972,7 +1092,7 @@ def cmd_app_add_collection(a):
     cfg = load_cfg(a.prefix)
     if TYPES[cfg["type"]][0] != "hub":
         die("app collections go on hub hosts")
-    if not NAME_RE.match(a.name) or not a.name[0].isalpha() or a.name in colls(cfg):
+    if not NAME_RE.fullmatch(a.name) or not a.name[0].isalpha() or a.name in colls(cfg):
         die(f"--name {a.name!r}: a new collection name")
     cfg["app_colls"] = sorted(set(cfg.get("app_colls") or []) | {a.name})
     save_cfg(cfg)
@@ -980,6 +1100,11 @@ def cmd_app_add_collection(a):
     req = write_request(cfg)
     print(f"Added app collection '{a.name}'. It needs a delegation too: sign {req} on the root "
           "machine (satchel-host root sign request.json), then run install-delegation.")
+
+
+def parse_rate(v):
+    from typed.hub import parse_rate as pr
+    return pr(v)
 
 
 def main(argv=None):
@@ -1010,7 +1135,15 @@ def main(argv=None):
     p.add_argument("--max-inboxes", type=int, default=1000, help="mail: inbox cap (default 1000)")
     p.add_argument("--room", action="append", default=[], help="rooms: another room on this host (repeatable)")
     p.add_argument("--max-file-mb", type=float, default=25, help="files: largest file in MiB (default 25)")
-    p.add_argument("--quota-mb", type=float, default=0, help="files: MiB each uploader may store (0 = no quota)")
+    p.add_argument("--quota-mb", type=float, default=DEFAULT_QUOTA_MB,
+                   help=f"files: MiB each uploader may store (default {DEFAULT_QUOTA_MB}, 0 = no per-uploader quota)")
+    p.add_argument("--total-mb", type=float, default=DEFAULT_TOTAL_MB,
+                   help=f"files: MiB all files may take together (default {DEFAULT_TOTAL_MB}; always on)")
+    p.add_argument("--pow-bits", type=int,
+                   help="proof of work per post (new keys need 2 bits more); default per type")
+    p.add_argument("--rate", action="append", type=parse_rate, default=[], metavar="N/SECONDS",
+                   help="hub types: writes per collection from all keys together, e.g. 600/3600 "
+                        "(repeatable; default per type)")
     sesh_args(p)
     p.set_defaults(fn=cmd_init)
     p = sp.add_parser("mail", help="mail host: open or close new-inbox sign-up, change the cap")
@@ -1024,6 +1157,7 @@ def main(argv=None):
     pre(p)
     p.add_argument("--max-file-mb", type=float)
     p.add_argument("--quota-mb", type=float)
+    p.add_argument("--total-mb", type=float)
     p.set_defaults(fn=cmd_files)
     p = sp.add_parser("moderate", help="hide, unhide, remove, pin or unpin (signed, public)")
     pre(p)
@@ -1063,7 +1197,7 @@ def main(argv=None):
     p.add_argument("--desc")
     p.add_argument("--directory-name", default="directory", help="name of the directory collection")
     p.add_argument("--root-key", default="./satchel-root/root.key")
-    p.add_argument("--pow-bits", type=int, default=14, help="proof-of-work bits (directory default 14)")
+    p.add_argument("--pow-bits", type=int, default=16, help="proof-of-work bits (default 16)")
     p.add_argument("--out", default="directory-entry.json")
     p.set_defaults(fn=cmd_root_directory_entry)
     p = r.add_parser("app-bundle", help="sign an app (a .js file) for an app collection")
@@ -1076,7 +1210,7 @@ def main(argv=None):
     p.add_argument("--desc", help="one or two sentences, up to 300 characters")
     p.add_argument("--coll", default="apps", help="the app collection's name (default apps)")
     p.add_argument("--root-key", default="./satchel-root/root.key")
-    p.add_argument("--pow-bits", type=int, default=14, help="proof-of-work bits (default 14)")
+    p.add_argument("--pow-bits", type=int, default=16, help="proof-of-work bits (default 16)")
     p.add_argument("--out", help="default: <name>-<ver>.bundle.json")
     p.set_defaults(fn=cmd_root_app_bundle)
     ap_ = sp.add_parser("app", help="publish apps and choose which apps a collection opens with") \

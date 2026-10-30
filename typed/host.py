@@ -13,15 +13,18 @@ import mbfmt as F
 from .sync import http_json
 from .record import BOARD
 from .node import bind_ok, serve, url_of  # noqa: F401  (re-exported)
-from .ratelimit import RateLimiter
+from .ratelimit import RateLimiter, TokenBucket
 from .store import Store
 
 DEFAULT_POLICY = {
     "v": 1, "rules": "No illegal content, no spam, no doxxing. Hosts may hide posts "
                      "(signed and public; clients can override them locally) and remove "
-                     "illegal content (signed and public; the text or file is deleted).",
+                     "illegal content (signed and public; the text or file is removed from "
+                     "this host's database and storage, and clients drop their copies).",
     "appeal": "", "pow_bits": 18, "new_key_pow_bits": 21, "new_key_age_s": 86400,
     "rate": [[30, 3600], [200, 86400]], "new_key_rate": [[5, 3600]],
+    # one budget for the whole collection, whatever key signs (keys cost nothing to make)
+    "global_rate": [[600, 3600], [5000, 86400]], "delete_rate": [[30, 3600], [200, 86400]],
     "retention_days": 180, "checkpoint_valid_s": 3 * 3600,
 }
 
@@ -63,7 +66,10 @@ class Host:
         self.store = Store(os.path.join(data_dir, "log.sqlite3"))
         self.rl = RateLimiter([tuple(r) for r in self.policy["rate"]])
         self.rl_new = RateLimiter([tuple(r) for r in self.policy["new_key_rate"]])
+        self.rl_del = RateLimiter([tuple(r) for r in self.policy.get("delete_rate") or []])
+        self.rl_all = TokenBucket([tuple(r) for r in self.policy.get("global_rate") or []])
         self.clock, self.mirrors = clock, list(mirrors or [])
+        self._vacuumed = self.clock()
         self._cp, self._cp_lock = None, threading.Lock()
         self._kick = threading.Event()
         self.push_report: dict = {}
@@ -71,12 +77,13 @@ class Host:
         self.store.on_redact = self._on_redact
 
     def _on_redact(self, pid, env, tomb):
-        """Host remove of a file: delete its blob bytes too (unless another live item uses it)."""
-        if tomb.get("by") != "remove" or not self.blobs or not isinstance(env, dict):
+        """A file's item is removed, deleted by its author or aged out: delete its blob bytes
+        too (unless another live item uses it)."""
+        if not self.blobs or not isinstance(env, dict):
             return
         sha = env_body(env).get("sha256")
-        if sha and not any(env_body(e["env"]).get("sha256") == sha
-                           for e in self.store.since(0, 1 << 30) if "env" in e):
+        if isinstance(sha, str) and sha and not any(
+                env_body(e).get("sha256") == sha for e in self.store.live_mentioning(sha)):
             self.blobs.delete(sha)
 
     # ---- policy, incl. the room header (description + rules), signed via checkpoint ----
@@ -164,12 +171,17 @@ class Host:
                     return 400, {"ok": False, "error": err}
         except (F.FormatError, KeyError, TypeError, AttributeError) as e:
             return 400, {"ok": False, "error": str(e)}
-        if self.store.has(pid):  # replay is idempotent, never re-appended
-            return 200, {"ok": True, "id": pid, "seq": self.store.get(pid)["seq"], "dup": True}
-        new = self.is_new_key(author)
-        if not self.rl.allow(author) or (new and not self.rl_new.allow(author)):
-            return 429, {"ok": False, "error": "rate limited" + (" (new key)" if new else "")}
-        seq = self.store.append(self.codec.normalize(env), meta)
+        # check and append under the store lock, so parallel requests can't all pass the
+        # limits before any of them is written
+        with self.store.lock:
+            if self.store.has(pid):  # replay is idempotent, never re-appended
+                return 200, {"ok": True, "id": pid, "seq": self.store.get(pid)["seq"], "dup": True}
+            new = self.is_new_key(author)
+            if not self.rl.allow(author) or (new and not self.rl_new.allow(author)):
+                return 429, {"ok": False, "error": "rate limited" + (" (new key)" if new else "")}
+            if not self.rl_all.allow():
+                return 429, {"ok": False, "error": "rate limited (this host is busy; try later)"}
+            seq = self.store.append(self.codec.normalize(env), meta)
         self._kick.set()
         return 200, {"ok": True, "id": pid, "seq": seq}
 
@@ -180,24 +192,33 @@ class Host:
             return 400, {"ok": False, "error": str(e)}
         if abs(self.clock() - d["ts"]) > F.CLOCK_SKEW_S:
             return 400, {"ok": False, "error": "stale or future timestamp"}
-        for pid in d["targets"]:
-            e = self.store.get(pid)
-            if e is None:
-                return 400, {"ok": False, "error": f"unknown post {pid}"}
-            if "env" in e and self.store.author_of(pid) != d["author"]:
-                return 400, {"ok": False, "error": "can only delete your own posts"}
         rid = F.record_id(F.DELETE_DOMAIN, d)
         with self.store.lock:
+            if self.store.has_record(rid):  # replay of a delete we took: idempotent
+                return 200, {"ok": True, "rid": rid, "rseq": None, "dup": True}
+            for pid in d["targets"]:
+                e = self.store.get(pid)
+                if e is None:
+                    return 400, {"ok": False, "error": f"unknown post {pid}"}
+                # only a live post, and only by its author; a tombstone has no author to match
+                if "env" not in e:
+                    return 400, {"ok": False, "error": f"post {pid} is already gone"}
+                if self.store.author_of(pid) != d["author"]:
+                    return 400, {"ok": False, "error": "can only delete your own posts"}
+            if not self.rl_del.allow(d["author"]) or not self.rl_all.allow():
+                return 429, {"ok": False, "error": "rate limited"}
             rseq = self.store.add_record("delete", env, rid)
             for pid in d["targets"]:
-                self.store.redact(pid, {"by": "delete", "record": env})
+                self.store.redact(pid, {"by": "delete", "record": env}, scrub=False)
+            self.store.scrub()
         self._kick.set()
         return 200, {"ok": True, "rid": rid, "rseq": rseq, "dup": rseq is None}
 
     def moderate(self, action: str, target_type: str, target: str, reason: str) -> dict:
         """hide/unhide: signed public record, text kept, clients may override.
-        remove (posts only): signed public record AND the text (or file blob) is deleted here
-        at once, leaving a tombstone that carries the record; mirrors and clients redact too."""
+        remove (posts only): signed public record, and the text (or file blob) is taken out of
+        this host's database and storage right away, leaving a tombstone that carries the
+        record; mirrors and clients drop their copies when they next sync."""
         if action in ("remove", "pin") and not self.store.has(target):
             raise F.FormatError(f"unknown post {target}")
         if action == "pin":
@@ -224,7 +245,18 @@ class Host:
         if days <= 0:
             return 0
         cut = int(self.clock() - days * 86400)
-        return sum(self.store.redact(pid, {"by": "retention"}) for pid in self.store.older_than(cut))
+        n = sum(self.store.redact(pid, {"by": "retention"}, scrub=False)
+                for pid in self.store.older_than(cut))
+        if n:
+            self.store.scrub()
+        return n
+
+    def maintain(self, vacuum_every: float = 86400.0) -> None:
+        """Retention, then (once a day) a VACUUM so freed pages leave the database file."""
+        self.apply_retention()
+        if self.clock() - self._vacuumed >= vacuum_every:
+            self._vacuumed = self.clock()
+            self.store.vacuum()
 
     # ---- reads ----
     def checkpoint(self) -> dict:
@@ -293,7 +325,7 @@ class Host:
                 self._kick.wait(every)
                 self._kick.clear()
                 try:
-                    self.apply_retention()
+                    self.maintain()
                     if self.mirrors:
                         self.push()
                 except Exception as e:  # keep serving even if a tick fails

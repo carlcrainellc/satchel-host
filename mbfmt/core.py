@@ -217,21 +217,36 @@ def chain_next(prev_head: str, seq: int, pid: str) -> str:
 
 # ---- delegation: offline board root key -> online host key -------------------------------
 def make_delegation(root: Ed25519PrivateKey, board: str, host_pub: str, expires: int,
-                    policy_hash: str = "") -> dict:
+                    policy_hash: str = "", issued: int | None = None) -> dict:
     d = {"v": 1, "board": board, "root": pub_hex(root), "host": host_pub,
-         "issued": int(time.time()), "expires": expires, "policy": policy_hash}
+         "issued": int(time.time()) if issued is None else int(issued), "expires": expires,
+         "policy": policy_hash}
     return {"delegation": d, "sig": root.sign(canonical(DELEGATION_DOMAIN, d)).hex()}
 
 
 def verify_delegation(env: dict, root_pin: str, board: str, now: float | None = None) -> str:
+    """Check a root-signed delegation and return the host key it names.
+
+    Refused unless: it is for this root and board, the root's signature checks, it was issued
+    no later than now + CLOCK_SKEW_S (a delegation dated in the future is refused), it hasn't
+    expired, expires comes after issued, and it runs at most MAX_DELEGATION_S (90 days) from
+    issued to expires."""
     d = env.get("delegation") if isinstance(env, dict) else None
     if not isinstance(d, dict) or d.get("root") != root_pin or d.get("board") != board:
         raise FormatError("delegation not for this root/board")
     if not _verify(root_pin, env.get("sig"), canonical(DELEGATION_DOMAIN, d)):
         raise FormatError("bad delegation signature")
-    if (time.time() if now is None else now) > d.get("expires", 0):
+    issued, expires = d.get("issued"), d.get("expires")
+    if not all(isinstance(x, int) and not isinstance(x, bool) for x in (issued, expires)):
+        raise FormatError("delegation issued/expires must be integers")
+    now = time.time() if now is None else now
+    if issued > now + CLOCK_SKEW_S:
+        raise FormatError("delegation issued in the future")
+    if now > expires:
         raise FormatError("delegation expired")
-    if d.get("expires", 0) - d.get("issued", 0) > MAX_DELEGATION_S + 3600:
+    if expires <= issued:
+        raise FormatError("delegation expires before it was issued")
+    if expires - issued > MAX_DELEGATION_S:
         raise FormatError("delegation longer than 90 days")
     load_pub(d["host"])
     return d["host"]

@@ -239,6 +239,22 @@ def host_rules(host, meta) -> str | None:
             else max_cipher_len(pol["max_file_bytes"])
         if meta.body["size"] > lim:
             return f"file too large for this drop (max {pol['max_file_bytes']} bytes)"
-    if meta.t in ("wiki.protect", "room.topic") and meta.author not in pol.get("admins", []):
+    admins = pol.get("admins", [])
+    if meta.t in ("wiki.protect", "room.topic") and meta.author not in admins:
         return f"{meta.t} needs an admin key"
+    if meta.t in ("wiki.page", "wiki.rev", "wiki.revert") and meta.author not in admins \
+            and wiki_protected(host, meta.body.get("slug"), admins):
+        return "this page is protected: only admins can edit it"
     return None
+
+
+def wiki_protected(host, slug, admins) -> bool:
+    """Whether the latest admin wiki.protect for slug in the host's log turned protection on
+    (the same rule wiki_view applies)."""
+    from .host import env_body
+    on = False
+    for author, env in host.store.live_of_type("wiki.protect"):
+        b = env_body(env)
+        if author in admins and b.get("slug") == slug:
+            on = bool(b.get("on"))
+    return on

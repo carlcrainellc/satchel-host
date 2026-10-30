@@ -97,11 +97,16 @@ def make_handler(resolve):
             node, sub = resolve(urlparse(self.path).path)
             if node is None:
                 return self._send(404, {"error": "not found"})
-            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._send(400, {"ok": False, "error": "bad Content-Length"})
             if sub == "/v1/blob" and getattr(node, "blobs", None):
-                if n <= 0 or n > node.blobs.max_bytes:
-                    return self._send(413, {"ok": False, "error": "size"})
-                return self._send(*node.blobs.put(self.rfile.read(n)))
+                # unsigned single-shot uploads are gone: nothing would tie the bytes to a key
+                # or a quota.  Satchel uses the signed /v1/upload below.  The body isn't read,
+                # so the connection is closed after the answer.
+                self.close_connection = True
+                return self._send(403, {"ok": False, "error": "use the signed /v1/upload"})
             if sub == "/v1/upload" and getattr(node, "blobs", None):
                 if n <= 0 or n > MAX_POST:
                     return self._send(413, {"ok": False, "error": "size"})
@@ -114,12 +119,14 @@ def make_handler(resolve):
                 from .hub import UP_CHUNK
                 if n < 0 or n > UP_CHUNK:
                     return self._send(413, {"ok": False, "error": "chunk size"})
+                q = parse_qs(urlparse(self.path).query)
                 try:
-                    off = int(parse_qs(urlparse(self.path).query).get("off", ["-1"])[0])
+                    off = int(q.get("off", ["-1"])[0])
                 except ValueError:
                     return self._send(400, {"ok": False, "error": "offset"})
+                # s = the session token /v1/upload returned (optional for Satchel 0.3.0)
                 return self._send(*node.blobs.chunk(sub.rsplit("/", 1)[1], off,
-                                                    self.rfile.read(n)))
+                                                    self.rfile.read(n), session=q.get("s", [None])[0]))
             routes = {"/v1/submit": (node.submit, MAX_POST), "/v1/delete": (node.delete, MAX_POST)}
             if hasattr(node, "publish"):
                 routes["/v1/publish"] = (node.publish, MAX_PUBLISH)

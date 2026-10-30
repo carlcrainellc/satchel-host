@@ -35,7 +35,8 @@ APP_BUNDLE = R.TypeSpec("app.bundle", 1, {
 APP_DATA = R.TypeSpec("app.data", 1, {
     "kind": R.pattern(r"[a-z][a-z0-9_]{0,23}", what="record kind"), "text": R.text(2000)}, 1)
 
-POLICY = {"rate": [[20, 3600]], "pow_bits": 12, "new_key_pow_bits": 14}
+POLICY = {"rate": [[20, 3600]], "global_rate": [[200, 3600], [2000, 86400]],
+          "pow_bits": 12, "new_key_pow_bits": 16}
 
 R.KIND_TYPES["app"] = R.TypeSet(APP_BUNDLE, APP_DATA, *R.PROFILE_TYPES)
 
@@ -101,7 +102,7 @@ class BundleStore:
 
     def __init__(self, d, coll=""):
         from .hub import BlobStore
-        self._b = BlobStore(d, APP_MAX_BYTES, 0, coll)
+        self._b = BlobStore(d, APP_MAX_BYTES, 0, coll, manage_uploads=False)  # no uploads here
         self.d, self.coll = d, coll
         self.max_bytes, self.max_file_bytes, self.quota_bytes = 0, APP_MAX_BYTES, 0
 
