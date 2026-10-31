@@ -142,7 +142,7 @@ built.
 | Path | What |
 |---|---|
 | `bin/satchel-host` | the tool you use to set up and run a host |
-| `typed/` | the host program itself: records, rules, saved checkpoints, rooms, apps, mail, voice |
+| `typed/` | the host program itself: records, rules, checkpoints (signed snapshots that let Satchel spot a host rolling back or hiding posts), rooms, apps, mail, voice |
 | `mbfmt/ mbhost/ mbclient/` | the older message board: its data format, its host, and a small client that `scripts/demo.py` uses |
 | `apps/` | the starter app and the example apps |
 | `docs/` | the host guide, the app guides and the license notes |

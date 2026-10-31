@@ -52,7 +52,7 @@ Types:
 
 Names start with a letter and use lowercase letters, digits and dashes. Options: `--port`,
 `--prefix` (default `/opt/satchel-host/<name>`), `--admin <pubkey>` (wiki, rooms, people,
-directory, apps), `--apps NAME` (any of those: also serve an app collection called NAME on the
+directory, apps), `--apps NAME` (any of those, or files: also serve an app collection called NAME on the
 same host, see "Apps" below) and `--voice` (rooms: take voice clips, see "Voice clips").
 
 `init` also asks about the host's own **`.sesh` name**: **make** a new key, **import** a key file
