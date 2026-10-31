@@ -8,7 +8,8 @@ Review queue
   as signed, and the link counts as approved) or rejects it (it is dropped). Later entries for
   an approved link (a new title or description, signed by the same root key) go straight in.
   A new link always waits for approval again. Links listed before the queue existed count as
-  approved.
+  approved, and so do links signed by the directory's own root key (the operator listing
+  their own collections).
 
 Refreshes (directory.alive)
   A listed host signs {link, deleg} with its online host key, where deleg is the delegation
@@ -47,7 +48,7 @@ ALIVE_TYPE = "directory.alive"
 ENTRY_TYPE = "directory.entry"
 ACTIVE_S = 86400            # a listing with nothing newer than this shows as inactive
 REFRESH_S = 3600            # how often hosts refresh
-ALIVE_RATE = [(12, 3600)]   # refreshes per host key
+ALIVE_RATE = [(12, 3600)]   # refreshes per listed link
 MAX_PENDING = 200           # whole queue
 MAX_PENDING_PER_KEY = 5     # per signing key
 MAX_ALIVE_SERVED = 2000
@@ -154,6 +155,12 @@ class Board:
                     self.db.execute("INSERT OR IGNORE INTO dir_approved VALUES(?,?,?)", (link, self._now(), "listed before review"))
             self.db.execute("INSERT OR REPLACE INTO dir_meta VALUES('seeded', ?)", (str(self._now()),))
 
+    def own_root(self):
+        """The root key that delegated this directory (its operator), or None."""
+        d = self.h.delegation if isinstance(self.h.delegation, dict) else {}
+        r = (d.get("delegation") or {}).get("root") if isinstance(d.get("delegation"), dict) else None
+        return r if isinstance(r, str) and len(r) == 64 else None
+
     # ---- queue ----
     def approved(self, link: str) -> bool:
         return self.db.execute("SELECT 1 FROM dir_approved WHERE link=?", (link,)).fetchone() is not None
@@ -192,6 +199,10 @@ class Board:
                     return 400, {"ok": False, "error": err}
         except (F.FormatError, KeyError, TypeError, AttributeError) as e:
             return 400, {"ok": False, "error": str(e)}
+        if not self.approved(link) and meta.author == self.own_root():
+            with self.lock:
+                self.db.execute("INSERT OR IGNORE INTO dir_approved VALUES(?,?,?)",
+                                (link, self._now(), "the directory's own root key"))
         if self.approved(link):
             return orig(env)
         with self.lock:
@@ -279,7 +290,7 @@ class Board:
             return 403, {"ok": False, "error": "this listing is waiting for the directory's approval (or isn't listed here)"}
         if not self.listed(link):
             return 404, {"ok": False, "error": "no listing for this link here"}
-        if not self.rl_alive.allow(host_pub):
+        if not self.rl_alive.allow(link):
             return 429, {"ok": False, "error": "rate limited"}
         with self.lock:
             row = self.db.execute("SELECT ts FROM dir_alive WHERE link=?", (link,)).fetchone()
@@ -334,8 +345,9 @@ def dir_coll_of(url: str) -> str:
     return parts[1] if len(parts) >= 2 and parts[0] == "c" else "directory"
 
 
-def refresh(host_key, deleg_dir: str, links: list, to: str, post=None, ts=None) -> list:
-    """Sign and post one refresh per link. -> [(link, ok, message)]."""
+def refresh(host_key, deleg_dir, links: list, to: str, post=None, ts=None) -> list:
+    """Sign and post one refresh per link. deleg_dir: a directory of <collection>.json
+    delegations, or a function collection name -> delegation. -> [(link, ok, message)]."""
     if post is None:
         from typed.sync import http_json as post
     to, coll, out = to.rstrip("/"), dir_coll_of(to), []
@@ -345,11 +357,14 @@ def refresh(host_key, deleg_dir: str, links: list, to: str, post=None, ts=None) 
             out.append((link, False, "not a collection link"))
             continue
         try:
-            with open(os.path.join(deleg_dir, p[2] + ".json")) as f:
-                deleg = json.load(f)
+            if callable(deleg_dir):
+                deleg = deleg_dir(p[2])
+            else:
+                with open(os.path.join(deleg_dir, p[2] + ".json")) as f:
+                    deleg = json.load(f)
             env = make_alive(host_key, coll, link, deleg, ts=ts)
             code, r = post(to + "/v1/submit", env)
-        except (OSError, ValueError, F.FormatError) as e:
+        except (OSError, ValueError, KeyError, F.FormatError) as e:
             out.append((link, False, str(e)))
             continue
         if code == 200 and r.get("ok"):
@@ -384,7 +399,7 @@ def main(argv=None, host_cls=None, load_key=None):
             key = F.key_from_seed(f.read()[:32])
         res = refresh(key, a.deleg_dir, a.link, a.to)
         for link, ok, msg in res:
-            print(f"{'ok ' if ok else 'no '} {link}: {msg}")
+            print(f"{'ok' if ok else 'no'} {link}: {msg}")
         return 0 if all(ok for _, ok, _ in res) else 1
     if a.action in ("approve", "reject", "unapprove") and not a.target:
         ap.error(f"{a.action} needs a pending id or a link")

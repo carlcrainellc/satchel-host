@@ -1065,7 +1065,7 @@ def cmd_directory_refresh(a):
         os.environ["http_proxy"] = a.proxy
     res = DB.refresh(key, _deleg_dir(cfg), lks, to)
     for link, ok, msg in res:
-        print(f"{'ok ' if ok else 'no '} {link}: {msg}")
+        print(f"{'ok' if ok else 'no'} {link}: {msg}")
     if not all(ok for _, ok, _ in res) and a.timer != "on":
         sys.exit(1)
 

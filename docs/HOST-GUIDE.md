@@ -150,10 +150,10 @@ listed collection's own root key. New links queue for you:
     sudo ./bin/satchel-host directory unapprove --prefix /opt/satchel-host/directory <link>
 
 `approve` shows the entry and asks you to type APPROVE. Pending entries are visible only
-through these commands. `python3 -m typed.admin --data <prefix>/data --coll directory pending`
-does the same from the app directory. Entries that were already listed before you upgraded
-count as approved. To take a listing down, use `unapprove` together with the removal commands
-under "Moderating".
+through these commands. `python3 -m typed.admin --data <prefix>/data --coll directory
+pending` does the same from the app directory. Entries that were already listed before you
+upgraded count as approved, and so do entries signed by the directory's own root key. To take
+a listing down, use `unapprove` together with the removal commands under "Moderating".
 
 ## Apps
 

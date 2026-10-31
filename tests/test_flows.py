@@ -151,15 +151,26 @@ class Flows(unittest.TestCase):
             "--root-key", f"{self.t}/root/root.key", "--out", out)
         to = f"http://127.0.0.1:{d['port']}/c/directory"
         r = run("directory-submit", out, "--to", to)
-        self.assertIn("waiting for approval", r.stdout)  # a new link waits for the admin
+        self.assertIn("Listed", r.stdout)  # signed by the directory's own root: listed at once
         logs = lambda: json.load(urllib.request.urlopen(to + "/v1/log"))["entries"]  # noqa: E731
-        self.assertEqual(logs(), [])
+        titles = lambda: [e["env"]["rec"]["body"]["title"] for e in logs()]  # noqa: E731
+        self.assertEqual(titles(), ["Hikers"])
+        # someone else's link (another root key) waits for the admin
+        if not os.path.exists(f"{self.t}/root2/root.key"):
+            run("root", "init", "--dir", f"{self.t}/root2")
+        pin2 = open(f"{self.t}/root2/root.pin").read().strip()
+        walk = J.make(f"127.0.0.1:{self.hosts['rooms']['port']}", "room", "walkers", pin2)
+        out3 = f"{self.t}/entry3.json"
+        run("root", "directory-entry", "--link", walk, "--title", "Walkers", "--root-key",
+            f"{self.t}/root2/root.key", "--out", out3)
+        self.assertIn("waiting for approval", run("directory-submit", out3, "--to", to).stdout)
+        self.assertEqual(titles(), ["Hikers"])
         pend = json.loads(run("directory", "pending", "--prefix", d["pre"]).stdout)["pending"]
-        self.assertEqual([p["title"] for p in pend], ["Hikers"])
-        r = run("directory", "approve", "--prefix", d["pre"], hikers, ok=False)  # asks first
+        self.assertEqual([p["title"] for p in pend], ["Walkers"])
+        r = run("directory", "approve", "--prefix", d["pre"], walk, ok=False)  # asks first
         self.assertNotEqual(r.returncode, 0)
-        run("directory", "approve", "--prefix", d["pre"], hikers, "--yes")
-        self.assertEqual([e["env"]["rec"]["body"]["title"] for e in logs()], ["Hikers"])
+        run("directory", "approve", "--prefix", d["pre"], walk, "--yes")
+        self.assertEqual(titles(), ["Hikers", "Walkers"])
         self.assertIn("Listed", run("directory-submit", out, "--to", to).stdout)  # replay: same entry
         # a new title for an approved link goes straight in, but only with --replace
         out2 = f"{self.t}/entry2.json"
@@ -205,8 +216,7 @@ class Flows(unittest.TestCase):
             f"{self.t}/root/root.key", "--out", e)
         d = self.hosts["directory"]
         to = f"http://127.0.0.1:{d['port']}/c/directory"
-        self.assertIn("waiting for approval", run("directory-submit", e, "--to", to).stdout)
-        run("directory", "approve", "--prefix", d["pre"], lk, "--yes")
+        self.assertIn("Listed", run("directory-submit", e, "--to", to).stdout)  # own root: at once
         self.assertIn("Listed", run("directory-submit", e, "--to", to).stdout)
         info = lambda: json.dumps(json.load(urllib.request.urlopen(f"http://127.0.0.1:{h['port']}/v1/mail/info")))
         self.assertIn('"open_registration": true', info())

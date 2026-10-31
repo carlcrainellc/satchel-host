@@ -10,7 +10,8 @@ from typed import dirboard as DB, node as N, views as V  # noqa: E402
 from typed.host import Host, load_host_key  # noqa: E402
 from typed.node import serve, url_of  # noqa: E402
 from typed.record import KIND_TYPES, codec_for, make_record  # noqa: E402
-from test_review_fixes import Clock, make_hub  # noqa: E402
+from test_review_fixes import LOW, Clock, make_hub  # noqa: E402
+from typed import hub as HUB  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -233,6 +234,28 @@ class Board(unittest.TestCase):
                          post=lambda url, env: self.h.submit(env))
         self.assertFalse(res[0][1])
         self.assertEqual(DB.dir_coll_of("http://abc.sesh/c/listings"), "listings")
+        # delegations from a function (a hub refreshing its own collections)
+        self.clock.t += 61
+        res = DB.refresh(a.hk, lambda n: {"hikers": a.deleg}[n], [a.link], "http://x/c/directory",
+                         post=lambda url, env: self.h.submit(env))
+        self.assertEqual(res, [(a.link, True, "refreshed")])
+
+    def test_the_directorys_own_root_needs_no_review(self):
+        root = F.new_key()
+        hub2 = HUB.Hub(tmpdir(), root, F.new_key(), [("directory", "directory")], {"admins": []},
+                       clock=self.clock, pol_override={"directory": dict(LOW)})
+        h = hub2.nodes["directory"]
+        self.assertEqual(h.dirboard.own_root(), F.pub_hex(root))
+        link = f"srnet://{F.zb32(os.urandom(32))}.sesh/room/chat#root={F.pub_hex(root)}"
+        env = make_record(root, KIND_TYPES["directory"], "directory", "directory.entry",
+                          {"link": link, "title": "Our chat"}, [], ts=int(self.clock()), pow_bits=8)
+        code, r = h.submit(env)
+        self.assertEqual((code, r.get("pending")), (200, None))
+        self.assertEqual(log_titles(h), ["Our chat"])
+        self.assertEqual(h.dirboard.approved_links()[0]["how"], "the directory's own root key")
+        # someone else's root still waits
+        a = Listed(clock=self.clock)
+        self.assertEqual(h.submit(a.entry("Hikers", self.clock))[0], 202)
 
 
 if __name__ == "__main__":
