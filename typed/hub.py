@@ -47,6 +47,7 @@ KIND_POLICY = {  # lighter limits for rooms; heavier for wiki
                   "pow_bits": 12, "new_key_pow_bits": 16},
 }
 from . import apps as APPS  # noqa: E402  (registers the "app" kind)
+from . import dirboard as DIRBOARD  # noqa: E402
 KIND_POLICY["app"] = dict(APPS.POLICY, retention_days=0)
 
 
@@ -344,6 +345,8 @@ class Hub:
                 h.blobs = BlobStore(os.path.join(data_dir, name, "blobs"),
                                     h.policy.get("max_file_bytes"), h.policy.get("quota_bytes"), name,
                                     total_bytes=h.policy.get("total_bytes"))
+            elif kind == "directory":  # review queue for new listings, and refreshes
+                DIRBOARD.attach(h)
             elif kind == "app":
                 h.blobs = APPS.BundleStore(os.path.join(data_dir, name, "blobs"), name)
             self.nodes[name], self.kinds[name] = h, kind

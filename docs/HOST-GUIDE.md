@@ -117,8 +117,43 @@ Carry `directory-entry.json` to any online machine and post it:
 
     ./bin/satchel-host directory-submit directory-entry.json --to http://<directory>.sesh/c/directory
 
-To run a directory yourself, use `--type directory`. Satchel shows only entries signed by the
-listed collection's own root key.
+A new link waits for the directory's admin. You'll see "Received; waiting for approval", and
+the entry isn't shown to anyone until it's approved. Once a link is approved, later entries
+for the same link (a new title or description) go straight in. A different link needs
+approval again. If the directory already lists your link under another title,
+`directory-submit` stops and asks for `--replace`, so you don't rename a listing by mistake.
+
+**Staying on the list.** Satchel hides a listing when its host hasn't checked in for 24 hours,
+and shows it again on the next check-in. Your host checks in with its online key and the
+delegation, which chains to the root key in your link, so nobody else can check in for you.
+Turn on the hourly check-in on the server:
+
+    sudo ./bin/satchel-host directory-refresh --prefix /opt/satchel-host/lobby \
+        --to http://<directory>.sesh/c/directory \
+        --link 'srnet://<name>.sesh/room/hikers#root=<pin>' --timer on
+
+Run it without `--timer` to check in once. `--timer off` stops it. If the server reaches
+`.sesh` names through a local proxy, add `--proxy http://127.0.0.1:<port>`.
+
+Satchel never pushes listings to anyone. People see the list only when they press **Find
+communities** on the home tab, and they join only after picking a listing and confirming the
+normal join sheet. The list is sorted by the latest check-in and shows "active N h ago".
+Listings that have gone quiet sit behind **Show inactive**.
+
+**Running a directory.** Use `--type directory`. Satchel shows only entries signed by the
+listed collection's own root key. New links queue for you:
+
+    sudo ./bin/satchel-host directory pending --prefix /opt/satchel-host/directory
+    sudo ./bin/satchel-host directory approve --prefix /opt/satchel-host/directory <id or link>
+    sudo ./bin/satchel-host directory reject  --prefix /opt/satchel-host/directory <id or link> --reason spam
+    sudo ./bin/satchel-host directory approved --prefix /opt/satchel-host/directory
+    sudo ./bin/satchel-host directory unapprove --prefix /opt/satchel-host/directory <link>
+
+`approve` shows the entry and asks you to type APPROVE. Pending entries are visible only
+through these commands. `python3 -m typed.admin --data <prefix>/data --coll directory pending`
+does the same from the app directory. Entries that were already listed before you upgraded
+count as approved. To take a listing down, use `unapprove` together with the removal commands
+under "Moderating".
 
 ## Apps
 

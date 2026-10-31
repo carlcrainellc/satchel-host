@@ -1,6 +1,7 @@
 """HTTP front end shared by the primary host and mirrors.  JSON only, never HTML.
 
   GET  /v1/info /v1/delegation /v1/checkpoint /v1/policy
+  GET  /v1/alive   (directory collections: the newest refresh per listed link, typed/dirboard.py)
   GET  /v1/log?since=N&limit=M   /v1/records?since=N&limit=M   /v1/post/<id>   /v1/thread/<id>
   POST /v1/submit   (post envelope)          primary: accept; mirror: forward to primary
   POST /v1/delete   (author delete record)   primary: apply; mirror: forward
@@ -31,6 +32,9 @@ def _get(node, path, q):
         return (200, v) if v else (503, {"error": "not ready"})
     if path == "/v1/log":
         return 200, {"entries": st.since(since, limit)}
+    if path == "/v1/alive":
+        f = getattr(node, "alive_list", None)
+        return (200, f()) if f else (404, {"error": "not found"})
     if path == "/v1/records":
         return 200, {"records": st.records_since(since, limit)}
     if len(parts) == 3 and parts[:2] == ["v1", "post"]:

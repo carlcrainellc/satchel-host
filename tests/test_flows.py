@@ -149,8 +149,45 @@ class Flows(unittest.TestCase):
         out = f"{self.t}/entry.json"
         run("root", "directory-entry", "--link", hikers, "--title", "Hikers", "--desc", "Weekend walks",
             "--root-key", f"{self.t}/root/root.key", "--out", out)
-        r = run("directory-submit", out, "--to", f"http://127.0.0.1:{d['port']}/c/directory")
-        self.assertIn("Listed", r.stdout)
+        to = f"http://127.0.0.1:{d['port']}/c/directory"
+        r = run("directory-submit", out, "--to", to)
+        self.assertIn("waiting for approval", r.stdout)  # a new link waits for the admin
+        logs = lambda: json.load(urllib.request.urlopen(to + "/v1/log"))["entries"]  # noqa: E731
+        self.assertEqual(logs(), [])
+        pend = json.loads(run("directory", "pending", "--prefix", d["pre"]).stdout)["pending"]
+        self.assertEqual([p["title"] for p in pend], ["Hikers"])
+        r = run("directory", "approve", "--prefix", d["pre"], hikers, ok=False)  # asks first
+        self.assertNotEqual(r.returncode, 0)
+        run("directory", "approve", "--prefix", d["pre"], hikers, "--yes")
+        self.assertEqual([e["env"]["rec"]["body"]["title"] for e in logs()], ["Hikers"])
+        self.assertIn("Listed", run("directory-submit", out, "--to", to).stdout)  # replay: same entry
+        # a new title for an approved link goes straight in, but only with --replace
+        out2 = f"{self.t}/entry2.json"
+        run("root", "directory-entry", "--link", hikers, "--title", "Hikers and walkers", "--root-key",
+            f"{self.t}/root/root.key", "--out", out2)
+        r = run("directory-submit", out2, "--to", to, ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--replace", r.stderr + r.stdout)
+        self.assertIn("Listed", run("directory-submit", out2, "--to", to, "--replace").stdout)
+        # the rooms host tells the directory it is still running (host key + delegation)
+        rooms = self.hosts["rooms"]
+        r = run("directory-refresh", "--prefix", rooms["pre"], "--to", to, "--link", hikers)
+        self.assertIn("ok ", r.stdout)
+        alive = json.load(urllib.request.urlopen(to + "/v1/alive"))["alive"]
+        self.assertEqual([a["rec"]["body"]["link"] for a in alive], [hikers])
+        # the lobby isn't listed: refused, nonzero exit
+        lobby = J.make(f"127.0.0.1:{rooms['port']}", "room", "lobby", self.pin)
+        r = run("directory-refresh", "--prefix", rooms["pre"], "--to", to, "--link", lobby, ok=False)
+        self.assertNotEqual(r.returncode, 0)
+        # --timer on writes the units (systemd isn't used in tests) and saves the settings
+        run("directory-refresh", "--prefix", rooms["pre"], "--to", to, "--link", hikers, "--timer", "on")
+        svc = open(f"{rooms['pre']}/dirrefresh.service").read()
+        self.assertIn("typed.dirboard", svc)
+        self.assertIn(hikers.split("#")[0], svc)
+        self.assertIn("OnUnitActiveSec=1h", open(f"{rooms['pre']}/dirrefresh.timer").read())
+        self.assertIn("ok ", run("directory-refresh", "--prefix", rooms["pre"]).stdout)
+        run("directory-refresh", "--prefix", rooms["pre"], "--timer", "off")
+        Flows._listed = True
         other = J.make(f"127.0.0.1:{self.hosts['rooms']['port']}", "room", "hikers", "cd" * 32)
         r = run("root", "directory-entry", "--link", other, "--title", "x", "--root-key",
                 f"{self.t}/root/root.key", "--out", f"{self.t}/bad.json", ok=False)
@@ -167,7 +204,10 @@ class Flows(unittest.TestCase):
         run("root", "directory-entry", "--link", lk, "--title", "Free mail", "--root-key",
             f"{self.t}/root/root.key", "--out", e)
         d = self.hosts["directory"]
-        self.assertIn("Listed", run("directory-submit", e, "--to", f"http://127.0.0.1:{d['port']}/c/directory").stdout)
+        to = f"http://127.0.0.1:{d['port']}/c/directory"
+        self.assertIn("waiting for approval", run("directory-submit", e, "--to", to).stdout)
+        run("directory", "approve", "--prefix", d["pre"], lk, "--yes")
+        self.assertIn("Listed", run("directory-submit", e, "--to", to).stdout)
         info = lambda: json.dumps(json.load(urllib.request.urlopen(f"http://127.0.0.1:{h['port']}/v1/mail/info")))
         self.assertIn('"open_registration": true', info())
         run("mail", "--prefix", h["pre"], "--closed")
@@ -257,7 +297,8 @@ class Flows(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_CLIENT, "set PY_CLIENT to a reference client checkout")
     def test_07_real_client_join_directory_mail(self):
-        self.test_04_directory_entry_and_submit()
+        if not getattr(Flows, "_listed", False):
+            self.test_04_directory_entry_and_submit()
         code = r'''
 import json, sys, os
 sys.path[:0] = [os.path.join(sys.argv[1], "snapps")]
@@ -288,7 +329,7 @@ print(json.dumps(out))
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertEqual(out["preview"], ["hikers", self.pin, True])
-        self.assertIn("Hikers", out["entries"])
+        self.assertIn("Hikers and walkers", out["entries"])  # a 0.3.0 client is fine with refreshes
         self.assertIn("hikers", out["sidebar"])
         self.assertEqual(out["share_root"], self.pin)
         self.assertTrue(out["mail_link"])

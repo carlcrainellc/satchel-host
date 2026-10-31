@@ -6,6 +6,7 @@ Templates only ever see the output of these functions."""
 from __future__ import annotations
 
 import hashlib
+import time
 
 import mbfmt as F
 
@@ -203,10 +204,16 @@ def drop_view(items, policy, me: str | None = None, my_enc: str | None = None) -
     return {"items": out}
 
 
-def directory_view(items, policy) -> dict:
+def directory_view(items, policy, alive=None, now=None) -> dict:
+    """Listings signed by their own root key, newest entry per link. alive: link -> ts of the
+    newest checked refresh (typed/dirboard.py). Sorted by the latest sign of life, newest
+    first; a listing with none in the last 24 hours is marked inactive (clients hide those
+    unless asked)."""
     from .joins import LinkError, parse
     ids = identities(items)
     entries = {}
+    alive = alive or {}
+    now = time.time() if now is None else now
     for it in items:
         if it.get("t") != "directory.entry":
             continue
@@ -217,10 +224,17 @@ def directory_view(items, policy) -> dict:
             continue
         if not l.get("root") or it["author"] != l["root"]:
             continue  # only the collection's own root key can list it (host opt-in)
+        old = entries.get(b["link"])
+        if old and old["ts"] > it["ts"]:
+            continue
         entries[b["link"]] = {"id": it["id"], "link": b["link"], "title": b["title"], "desc": b.get("desc") or "",
                               "host": l["host"], "kind": l["kind"], "name": l["name"],
                               "by": label(ids, it["author"]), "ts": it["ts"]}
-    return {"entries": sorted(entries.values(), key=lambda e: e["title"].lower())}
+    for e in entries.values():
+        a = max(e["ts"], int(alive.get(e["link"], 0)))
+        e["active_ts"], e["ago_h"] = a, max(0, int((now - a) // 3600))
+        e["inactive"] = now - a > 86400
+    return {"entries": sorted(entries.values(), key=lambda e: (-e["active_ts"], e["title"].lower()))}
 
 
 VIEWS = {"directory": directory_view, "room": room_view, "wiki": wiki_view, "drop": drop_view,

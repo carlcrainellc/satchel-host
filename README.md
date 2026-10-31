@@ -99,6 +99,9 @@ Once the host is running, you'll use these:
 - `moderate`: hide, pin or remove posts.
 - `app publish` and `app use`: add apps and choose which apps a collection opens with.
 - `root directory-entry` and then `directory-submit`: list your community in a directory.
+  New listings wait for the directory admin's approval.
+- `directory-refresh`: check in with a directory every hour so your listing stays active.
+- `directory pending|approve|reject|approved|unapprove`: review listings on a directory you run.
 
 ### Invite links
 
